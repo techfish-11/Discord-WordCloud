@@ -23,7 +23,7 @@ DBは同じディレクトリの `wordcloud.db` に作られる。場所を変�
 
 ## Discordでの設定
 
-- `/wordcloud set channel:#チャンネル` — 記録を開始（サーバー管理権限が必要）
+- `/wordcloud set channel:#チャンネル` — 記録を開始（メッセージの管理権限が必要）
 - `/wordcloud status` — 現在の設定を確認
 - `/wordcloud disable` — 記録を停止
 

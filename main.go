@@ -151,8 +151,8 @@ func (a *App) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 	if i.Type != discordgo.InteractionApplicationCommand || i.GuildID == "" {
 		return
 	}
-	if !hasManageGuild(i.Member) {
-		respond(s, i, "この設定を変更するにはサーバー管理権限が必要だよ", true)
+	if !hasManageMessages(i.Member) {
+		respond(s, i, "この設定を変更するにはメッセージの管理権限が必要だよ", true)
 		return
 	}
 	op := i.ApplicationCommandData().Options[0]
@@ -363,8 +363,8 @@ func (a *App) face(size int) (font.Face, error) {
 	}
 	return f, err
 }
-func hasManageGuild(m *discordgo.Member) bool {
-	return m != nil && (m.Permissions&discordgo.PermissionManageServer) != 0
+func hasManageMessages(m *discordgo.Member) bool {
+	return m != nil && (m.Permissions&discordgo.PermissionManageMessages) != 0
 }
 func respond(s *discordgo.Session, i *discordgo.InteractionCreate, msg string, ephemeral bool) {
 	flags := discordgo.MessageFlags(0)
