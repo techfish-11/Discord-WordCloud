@@ -74,11 +74,11 @@ func count(words []string, target string) int {
 }
 
 func TestScaledFontSize(t *testing.T) {
-	if got := scaledFontSize(2, 2, 20); got != 28 {
-		t.Errorf("scaledFontSize(min) = %d, want 28", got)
+	if got := scaledFontSize(2, 2, 20); got != 18 {
+		t.Errorf("scaledFontSize(min) = %d, want 18", got)
 	}
-	if got := scaledFontSize(20, 2, 20); got != 124 {
-		t.Errorf("scaledFontSize(max) = %d, want 124", got)
+	if got := scaledFontSize(20, 2, 20); got != 132 {
+		t.Errorf("scaledFontSize(max) = %d, want 132", got)
 	}
 	if low, high := scaledFontSize(4, 2, 20), scaledFontSize(10, 2, 20); low >= high {
 		t.Errorf("scaledFontSize is not monotonic: low=%d high=%d", low, high)
@@ -97,6 +97,31 @@ func TestRenderProducesPNGWithEmbeddedJapaneseFont(t *testing.T) {
 	}
 	if got := img.Bounds().Size(); got.X != 1600 || got.Y != 900 {
 		t.Fatalf("image size = %v, want 1600x900", got)
+	}
+}
+
+func TestWordSpriteRotationAndPixelCollision(t *testing.T) {
+	app := &App{fonts: make(map[int]font.Face)}
+	horizontal, err := app.wordSprite("ワードクラウド", 48, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vertical, err := app.wordSprite("ワードクラウド", 48, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if horizontal.Rect.Dx() != vertical.Rect.Dy() || horizontal.Rect.Dy() != vertical.Rect.Dx() {
+		t.Fatalf("rotated bounds = %v, horizontal bounds = %v", vertical.Rect, horizontal.Rect)
+	}
+
+	const width, height = 1200, 400
+	occupied := make([]bool, width*height)
+	markOccupied(horizontal, occupied, width, 100, 100)
+	if spriteFits(horizontal, occupied, width, height, 100, 100) {
+		t.Fatal("spriteFits accepted overlapping glyph pixels")
+	}
+	if !spriteFits(horizontal, occupied, width, height, 700, 250) {
+		t.Fatal("spriteFits rejected a non-overlapping position")
 	}
 }
 

@@ -304,8 +304,8 @@ func (a *App) generate(guildID, channelID, day string) ([]byte, error) {
 		}
 		return words[i].Text < words[j].Text
 	})
-	if len(words) > 80 {
-		words = words[:80]
+	if len(words) > 140 {
+		words = words[:140]
 	}
 	if len(words) == 0 {
 		return nil, errNoWords
@@ -314,54 +314,41 @@ func (a *App) generate(guildID, channelID, day string) ([]byte, error) {
 }
 
 func (a *App) render(words []Word, day string) ([]byte, error) {
-	img := image.NewRGBA(image.Rect(0, 0, 1600, 900))
+	const width, height, headerHeight = 1600, 900, 68
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	draw.Draw(img, img.Bounds(), &image.Uniform{color.RGBA{248, 250, 252, 255}}, image.Point{}, draw.Src)
-	r := rand.New(rand.NewSource(int64(len(words)) * 7919))
-	placed := []image.Rectangle{}
+	r := rand.New(rand.NewSource(int64(len(words))*7919 + int64(words[0].Count)))
 	palette := []color.RGBA{{38, 99, 235, 255}, {14, 116, 144, 255}, {124, 58, 237, 255}, {5, 150, 105, 255}, {219, 39, 119, 255}, {71, 85, 105, 255}}
+	occupied := make([]bool, width*height)
+	for y := 0; y < headerHeight; y++ {
+		for x := 0; x < width; x++ {
+			occupied[y*width+x] = true
+		}
+	}
 	minCount, maxCount := words[len(words)-1].Count, words[0].Count
 	for idx, w := range words {
-		size := scaledFontSize(w.Count, minCount, maxCount)
-		face, err := a.face(size)
-		if err != nil {
-			return nil, err
-		}
-		d := font.Drawer{Face: face}
-		tw := d.MeasureString(w.Text).Ceil()
-		th := size + 8
-		var rect image.Rectangle
-		found := false
-		for n := 0; n < 3000; n++ {
-			ang := float64(n) * 0.34
-			rad := float64(n) * 0.65
-			x := 800 + int(math.Cos(ang)*rad) - tw/2
-			y := 460 + int(math.Sin(ang)*rad) - th/2
-			rect = image.Rect(x-8, y-4, x+tw+8, y+th+4)
-			if rect.Min.X < 20 || rect.Max.X > 1580 || rect.Min.Y < 70 || rect.Max.Y > 870 {
-				continue
-			}
-			ok := true
-			for _, p := range placed {
-				if rect.Overlaps(p) {
-					ok = false
-					break
+		preferredVertical := r.Float64() < 0.28
+		placed := false
+		for size := scaledFontSize(w.Count, minCount, maxCount); size >= 15 && !placed; size -= 2 {
+			for orientation := 0; orientation < 2 && !placed; orientation++ {
+				vertical := preferredVertical
+				if orientation == 1 {
+					vertical = !vertical
 				}
-			}
-			if ok {
-				found = true
-				break
+				sprite, err := a.wordSprite(w.Text, size, vertical)
+				if err != nil {
+					return nil, err
+				}
+				x, y, ok := findPosition(sprite, occupied, width, height, headerHeight, r)
+				if !ok {
+					continue
+				}
+				markOccupied(sprite, occupied, width, x, y)
+				col := palette[(idx+int(r.Int31n(3)))%len(palette)]
+				draw.DrawMask(img, image.Rect(x, y, x+sprite.Rect.Dx(), y+sprite.Rect.Dy()), image.NewUniform(col), image.Point{}, sprite, image.Point{}, draw.Over)
+				placed = true
 			}
 		}
-		if !found {
-			continue
-		}
-		placed = append(placed, rect)
-		x, y := rect.Min.X+8, rect.Min.Y+th-8
-		d.Dst = img
-		d.Dot = fixed.P(x, y)
-		col := palette[(idx+int(r.Int31n(3)))%len(palette)]
-		d.Src = image.NewUniform(col)
-		d.DrawString(w.Text)
 	}
 	face, _ := a.face(28)
 	d := font.Drawer{Dst: img, Src: image.NewUniform(color.RGBA{30, 41, 59, 255}), Face: face, Dot: fixed.P(42, 52)}
@@ -369,6 +356,99 @@ func (a *App) render(words []Word, day string) ([]byte, error) {
 	var b bytes.Buffer
 	err := png.Encode(&b, img)
 	return b.Bytes(), err
+}
+
+func (a *App) wordSprite(text string, size int, vertical bool) (*image.Alpha, error) {
+	face, err := a.face(size)
+	if err != nil {
+		return nil, err
+	}
+	bounds, _ := font.BoundString(face, text)
+	const padding = 2
+	width := (bounds.Max.X - bounds.Min.X).Ceil() + padding*2
+	height := (bounds.Max.Y - bounds.Min.Y).Ceil() + padding*2
+	if width <= padding*2 || height <= padding*2 {
+		return nil, fmt.Errorf("invalid text bounds for %q", text)
+	}
+	mask := image.NewAlpha(image.Rect(0, 0, width, height))
+	d := font.Drawer{
+		Dst:  mask,
+		Src:  image.White,
+		Face: face,
+		Dot: fixed.Point26_6{
+			X: fixed.I(padding) - bounds.Min.X,
+			Y: fixed.I(padding) - bounds.Min.Y,
+		},
+	}
+	d.DrawString(text)
+	if !vertical {
+		return mask, nil
+	}
+	rotated := image.NewAlpha(image.Rect(0, 0, height, width))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			rotated.SetAlpha(y, width-1-x, mask.AlphaAt(x, y))
+		}
+	}
+	return rotated, nil
+}
+
+func findPosition(sprite *image.Alpha, occupied []bool, width, height, headerHeight int, r *rand.Rand) (int, int, bool) {
+	sw, sh := sprite.Rect.Dx(), sprite.Rect.Dy()
+	if sw > width-8 || sh > height-headerHeight-8 {
+		return 0, 0, false
+	}
+	centerX, centerY := width/2-sw/2, (headerHeight+height)/2-sh/2
+	for n := 0; n < 1100; n++ {
+		angle := float64(n) * 2.399963229728653
+		radius := 13 * math.Sqrt(float64(n))
+		x := centerX + int(math.Cos(angle)*radius*1.35)
+		y := centerY + int(math.Sin(angle)*radius*0.82)
+		if spriteFits(sprite, occupied, width, height, x, y) {
+			return x, y, true
+		}
+	}
+	maxX, maxY := width-sw-4, height-sh-4
+	for n := 0; n < 500; n++ {
+		x := 4 + r.Intn(maxX-3)
+		y := headerHeight + 2 + r.Intn(maxY-headerHeight-1)
+		if spriteFits(sprite, occupied, width, height, x, y) {
+			return x, y, true
+		}
+	}
+	return 0, 0, false
+}
+
+func spriteFits(sprite *image.Alpha, occupied []bool, width, height, offsetX, offsetY int) bool {
+	if offsetX < 2 || offsetY < 2 || offsetX+sprite.Rect.Dx()+2 > width || offsetY+sprite.Rect.Dy()+2 > height {
+		return false
+	}
+	for y := 0; y < sprite.Rect.Dy(); y++ {
+		for x := 0; x < sprite.Rect.Dx(); x++ {
+			if sprite.AlphaAt(x, y).A == 0 {
+				continue
+			}
+			px, py := offsetX+x, offsetY+y
+			for dy := -1; dy <= 1; dy++ {
+				for dx := -1; dx <= 1; dx++ {
+					if occupied[(py+dy)*width+px+dx] {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+func markOccupied(sprite *image.Alpha, occupied []bool, width, offsetX, offsetY int) {
+	for y := 0; y < sprite.Rect.Dy(); y++ {
+		for x := 0; x < sprite.Rect.Dx(); x++ {
+			if sprite.AlphaAt(x, y).A != 0 {
+				occupied[(offsetY+y)*width+offsetX+x] = true
+			}
+		}
+	}
 }
 
 func (a *App) face(size int) (font.Face, error) {
@@ -400,9 +480,9 @@ func (a *App) face(size int) (font.Face, error) {
 }
 
 func scaledFontSize(count, minCount, maxCount int) int {
-	const minSize, maxSize = 28, 124
+	const minSize, maxSize = 18, 132
 	if maxCount <= minCount {
-		return (minSize + maxSize) / 2
+		return 38
 	}
 	// Log scaling prevents one highly repeated word from dwarfing every other
 	// term while preserving the ordering of frequencies.
