@@ -423,6 +423,7 @@ func respond(s *discordgo.Session, i *discordgo.InteractionCreate, msg string, e
 func deferResponse(s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Flags: discordgo.MessageFlagsEphemeral},
 	})
 }
 

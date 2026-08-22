@@ -17,7 +17,7 @@ func TestTextAnalyzerTokenizeJapaneseContentWords(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := a.Tokenize("新しいゲームを遊んだけど、映像がすごく綺麗だった！ゲームは楽しいね")
-	for _, want := range []string{"新しい", "ゲーム", "遊ぶ", "映像", "綺麗", "楽しい"} {
+	for _, want := range []string{"新しい", "ゲーム", "遊んだ", "映像", "綺麗だった", "楽しい"} {
 		if !slices.Contains(got, want) {
 			t.Errorf("Tokenize() = %q, missing %q", got, want)
 		}
@@ -41,6 +41,24 @@ func TestTextAnalyzerNormalizesAndRemovesDiscordNoise(t *testing.T) {
 	for _, noise := range []string{"example", "const", "value", "party_parrot"} {
 		if slices.Contains(got, noise) {
 			t.Errorf("Tokenize() = %q, contains removed content %q", got, noise)
+		}
+	}
+}
+
+func TestTextAnalyzerPreservesInflectionAndSpelling(t *testing.T) {
+	a, err := NewTextAnalyzer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := a.Tokenize("昨日はわからなかった。今はわかる。理由は分からなかった")
+	for _, want := range []string{"わからなかった", "わかる", "分からなかった"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("Tokenize() = %q, missing %q", got, want)
+		}
+	}
+	for _, collapsed := range []string{"分かる", "わから", "分から"} {
+		if slices.Contains(got, collapsed) {
+			t.Errorf("Tokenize() = %q, contains collapsed expression %q", got, collapsed)
 		}
 	}
 }
