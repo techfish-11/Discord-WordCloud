@@ -19,15 +19,16 @@ DISCORD_TOKEN='ここにBot Token' ./discord-wordcloud
 
 DBは同じディレクトリの `wordcloud.db` に作られる。場所を変える場合は `WORDCLOUD_DB=/var/lib/discord-wordcloud/wordcloud.db` を指定する。
 
-日本語を画像に描画する場合は、日本語グリフを含むTTF/OTFを用意して `WORDCLOUD_FONT=/path/to/font.ttf` を指定する。未指定時はバイナリ内蔵フォントにフォールバックするため、英数字は動作するが日本語が豆腐になる場合がある。
+日本語フォント（Noto Sans JP）はバイナリへ内蔵される。別のTTF/OTFを使う場合のみ `WORDCLOUD_FONT=/path/to/font.ttf` を指定する。不正なパスやフォントはエラーとして扱われる。
 
 ## Discordでの設定
 
 - `/wordcloud set channel:#チャンネル` — 記録を開始（メッセージの管理権限が必要）
 - `/wordcloud status` — 現在の設定を確認
+- `/wordcloud preview` — 当日分の暫定ワードクラウドを生成（保存データは削除しない）
 - `/wordcloud disable` — 記録を停止
 
-メッセージ本文は日付単位で保存され、ワードクラウドの投稿に成功した後、その日のレコードを削除する。Bot自身のメッセージ、URL、メンションは集計対象外。日本語は2文字の連続語、英語は単語単位で集計する。
+メッセージ本文は日付単位で保存され、ワードクラウドの投稿に成功した後、その日のレコードを削除する。Bot自身のメッセージ、URL、メンション、コード、Discord絵文字名は集計対象外。日本語は形態素解析を行い、名詞・動詞・形容詞を原形へ正規化して集計する。1メッセージ内の過剰な反復は単語ごとに3回までに制限する。
 
 ## systemd例
 

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	_ "embed"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -12,16 +14,13 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"golang.org/x/image/font"
-	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 	_ "modernc.org/sqlite"
@@ -32,11 +31,15 @@ const (
 	maxMessageLength = 4000
 )
 
+var errNoWords = errors.New("集計対象の単語がありません")
+
 type App struct {
 	db    *sql.DB
 	loc   *time.Location
 	mu    sync.Mutex
 	fonts map[int]font.Face
+	text  *TextAnalyzer
+	ttf   *opentype.Font
 }
 
 type Word struct {
@@ -44,13 +47,8 @@ type Word struct {
 	Count int
 }
 
-var latinWord = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_'-]{1,30}`)
-var urlOrMention = regexp.MustCompile(`https?://\S+|<[@#!&]?\d+>`)
-var stopWords = map[string]bool{
-	"the": true, "and": true, "that": true, "this": true, "with": true, "from": true, "have": true, "www": true,
-	"です": true, "ます": true, "した": true, "して": true, "する": true, "ある": true, "いる": true, "これ": true, "それ": true,
-	"こと": true, "よう": true, "さん": true, "ちゃん": true, "ｗｗ": true,
-}
+//go:embed NotoSansJP-VariableFont_wght.ttf
+var defaultFontData []byte
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -67,7 +65,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face)}
+	analyzer, err := NewTextAnalyzer()
+	if err != nil {
+		log.Fatal(err)
+	}
+	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face), text: analyzer}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
@@ -119,6 +121,7 @@ func (a *App) onReady(s *discordgo.Session, _ *discordgo.Ready) {
 					},
 				},
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "status", Description: "現在の設定を表示します"},
+				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "preview", Description: "今日の暫定ワードクラウドを生成します"},
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "disable", Description: "記録を停止します"},
 			},
 		},
@@ -155,7 +158,12 @@ func (a *App) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 		respond(s, i, "この設定を変更するにはメッセージの管理権限が必要だよ", true)
 		return
 	}
-	op := i.ApplicationCommandData().Options[0]
+	options := i.ApplicationCommandData().Options
+	if len(options) != 1 {
+		respond(s, i, "サブコマンドを指定してね", true)
+		return
+	}
+	op := options[0]
 	switch op.Name {
 	case "set":
 		ch := op.Options[0].ChannelValue(s)
@@ -172,6 +180,8 @@ func (a *App) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 		} else {
 			respond(s, i, "記録チャンネル: <#"+ch+">", true)
 		}
+	case "preview":
+		a.preview(s, i)
 	case "disable":
 		_, err := a.db.Exec(`DELETE FROM settings WHERE guild_id=?`, i.GuildID)
 		if err != nil {
@@ -180,6 +190,40 @@ func (a *App) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 		}
 		respond(s, i, "記録を停止したよ。保存済みの過去データは削除していない", false)
 	}
+}
+
+func (a *App) preview(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	var channelID string
+	if err := a.db.QueryRow(`SELECT channel_id FROM settings WHERE guild_id=?`, i.GuildID).Scan(&channelID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			respond(s, i, "このサーバーは未設定だよ。先に `/wordcloud set` を実行してね", true)
+		} else {
+			log.Printf("preview settings %s: %v", i.GuildID, err)
+			respond(s, i, "設定の読み込みに失敗したよ", true)
+		}
+		return
+	}
+	if err := deferResponse(s, i); err != nil {
+		log.Printf("defer preview %s: %v", i.GuildID, err)
+		return
+	}
+
+	day := time.Now().In(a.loc).Format("2006-01-02")
+	pngData, err := a.generate(i.GuildID, channelID, day)
+	if errors.Is(err, errNoWords) {
+		editResponse(s, i, "今日（"+day+"）は、まだ集計できる単語がないよ", nil)
+		return
+	}
+	if err != nil {
+		log.Printf("preview %s: %v", i.GuildID, err)
+		editResponse(s, i, "暫定ワードクラウドの生成に失敗したよ", nil)
+		return
+	}
+	editResponse(s, i, "今日（"+day+"）の暫定ワードクラウドです。日次投稿用のデータは削除していません。", &discordgo.File{
+		Name:        "wordcloud-preview-" + day + ".png",
+		ContentType: "image/png",
+		Reader:      bytes.NewReader(pngData),
+	})
 }
 
 func (a *App) scheduler(s *discordgo.Session) {
@@ -210,19 +254,43 @@ func (a *App) scheduler(s *discordgo.Session) {
 }
 
 func (a *App) publish(s *discordgo.Session, guildID, channelID, day string) error {
-	rows, err := a.db.Query(`SELECT content FROM messages WHERE guild_id=? AND channel_id=? AND day=?`, guildID, channelID, day)
+	pngData, err := a.generate(guildID, channelID, day)
+	if errors.Is(err, errNoWords) {
+		_, err = s.ChannelMessageSend(channelID, "昨日（"+day+"）は、集計できるメッセージがなかったよ")
+	} else if err == nil {
+		_, err = s.ChannelFileSend(channelID, "wordcloud-"+day+".png", bytes.NewReader(pngData))
+	}
 	if err != nil {
 		return err
+	}
+	_, err = a.db.Exec(`DELETE FROM messages WHERE guild_id=? AND channel_id=? AND day=?`, guildID, channelID, day)
+	return err
+}
+
+func (a *App) generate(guildID, channelID, day string) ([]byte, error) {
+	rows, err := a.db.Query(`SELECT content FROM messages WHERE guild_id=? AND channel_id=? AND day=?`, guildID, channelID, day)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	counts := map[string]int{}
 	for rows.Next() {
 		var text string
-		if rows.Scan(&text) == nil {
-			for _, w := range tokenize(text) {
+		if err := rows.Scan(&text); err != nil {
+			return nil, fmt.Errorf("scan message: %w", err)
+		}
+		perMessage := make(map[string]int)
+		for _, w := range a.text.Tokenize(text) {
+			// Limit repetition in a single message so pasted text or spam cannot
+			// dominate an entire day's conversation.
+			if perMessage[w] < 3 {
 				counts[w]++
+				perMessage[w]++
 			}
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read messages: %w", err)
 	}
 	words := make([]Word, 0, len(counts))
 	for w, c := range counts {
@@ -230,55 +298,19 @@ func (a *App) publish(s *discordgo.Session, guildID, channelID, day string) erro
 			words = append(words, Word{w, c})
 		}
 	}
-	sort.Slice(words, func(i, j int) bool { return words[i].Count > words[j].Count })
+	sort.Slice(words, func(i, j int) bool {
+		if words[i].Count != words[j].Count {
+			return words[i].Count > words[j].Count
+		}
+		return words[i].Text < words[j].Text
+	})
 	if len(words) > 80 {
 		words = words[:80]
 	}
 	if len(words) == 0 {
-		_, err = s.ChannelMessageSend(channelID, "昨日（"+day+"）は、集計できるメッセージがなかったよ")
-		if err == nil {
-			_, err = a.db.Exec(`DELETE FROM messages WHERE guild_id=? AND channel_id=? AND day=?`, guildID, channelID, day)
-		}
-		return err
+		return nil, errNoWords
 	}
-	pngData, err := a.render(words, day)
-	if err != nil {
-		return err
-	}
-	_, err = s.ChannelFileSend(channelID, "wordcloud-"+day+".png", bytes.NewReader(pngData))
-	if err == nil {
-		_, err = a.db.Exec(`DELETE FROM messages WHERE guild_id=? AND channel_id=? AND day=?`, guildID, channelID, day)
-	}
-	return err
-}
-
-func tokenize(text string) []string {
-	text = urlOrMention.ReplaceAllString(text, " ")
-	out := make([]string, 0)
-	for _, w := range latinWord.FindAllString(strings.ToLower(text), -1) {
-		if !stopWords[w] {
-			out = append(out, w)
-		}
-	}
-	run := []rune{}
-	flush := func() {
-		for i := 0; i+1 < len(run); i++ {
-			w := string(run[i : i+2])
-			if !stopWords[w] {
-				out = append(out, w)
-			}
-		}
-		run = nil
-	}
-	for _, r := range text {
-		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana) {
-			run = append(run, r)
-		} else {
-			flush()
-		}
-	}
-	flush()
-	return out
+	return a.render(words, day)
 }
 
 func (a *App) render(words []Word, day string) ([]byte, error) {
@@ -287,11 +319,9 @@ func (a *App) render(words []Word, day string) ([]byte, error) {
 	r := rand.New(rand.NewSource(int64(len(words)) * 7919))
 	placed := []image.Rectangle{}
 	palette := []color.RGBA{{38, 99, 235, 255}, {14, 116, 144, 255}, {124, 58, 237, 255}, {5, 150, 105, 255}, {219, 39, 119, 255}, {71, 85, 105, 255}}
+	minCount, maxCount := words[len(words)-1].Count, words[0].Count
 	for idx, w := range words {
-		size := 24 + int(math.Sqrt(float64(w.Count))*12)
-		if size > 116 {
-			size = 116
-		}
+		size := scaledFontSize(w.Count, minCount, maxCount)
 		face, err := a.face(size)
 		if err != nil {
 			return nil, err
@@ -347,21 +377,37 @@ func (a *App) face(size int) (font.Face, error) {
 	if f := a.fonts[size]; f != nil {
 		return f, nil
 	}
-	data := goregular.TTF
-	if path := os.Getenv("WORDCLOUD_FONT"); path != "" {
-		if b, err := os.ReadFile(path); err == nil {
-			data = b
+	if a.ttf == nil {
+		data := defaultFontData
+		if path := os.Getenv("WORDCLOUD_FONT"); path != "" {
+			var err error
+			data, err = os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("read WORDCLOUD_FONT %q: %w", path, err)
+			}
+		}
+		var err error
+		a.ttf, err = opentype.Parse(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse word-cloud font: %w", err)
 		}
 	}
-	tt, err := opentype.Parse(data)
-	if err != nil {
-		return nil, err
-	}
-	f, err := opentype.NewFace(tt, &opentype.FaceOptions{Size: float64(size), DPI: 72, Hinting: font.HintingFull})
+	f, err := opentype.NewFace(a.ttf, &opentype.FaceOptions{Size: float64(size), DPI: 72, Hinting: font.HintingFull})
 	if err == nil {
 		a.fonts[size] = f
 	}
 	return f, err
+}
+
+func scaledFontSize(count, minCount, maxCount int) int {
+	const minSize, maxSize = 28, 124
+	if maxCount <= minCount {
+		return (minSize + maxSize) / 2
+	}
+	// Log scaling prevents one highly repeated word from dwarfing every other
+	// term while preserving the ordering of frequencies.
+	ratio := math.Log1p(float64(count-minCount)) / math.Log1p(float64(maxCount-minCount))
+	return minSize + int(math.Round(ratio*(maxSize-minSize)))
 }
 func hasManageMessages(m *discordgo.Member) bool {
 	return m != nil && (m.Permissions&discordgo.PermissionManageMessages) != 0
@@ -372,6 +418,22 @@ func respond(s *discordgo.Session, i *discordgo.InteractionCreate, msg string, e
 		flags = discordgo.MessageFlagsEphemeral
 	}
 	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{Type: discordgo.InteractionResponseChannelMessageWithSource, Data: &discordgo.InteractionResponseData{Content: msg, Flags: flags}})
+}
+
+func deferResponse(s *discordgo.Session, i *discordgo.InteractionCreate) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+}
+
+func editResponse(s *discordgo.Session, i *discordgo.InteractionCreate, content string, file *discordgo.File) {
+	edit := &discordgo.WebhookEdit{Content: &content}
+	if file != nil {
+		edit.Files = []*discordgo.File{file}
+	}
+	if _, err := s.InteractionResponseEdit(i.Interaction, edit); err != nil {
+		log.Printf("edit interaction response %s: %v", i.ID, err)
+	}
 }
 func getenv(k, d string) string {
 	if v := os.Getenv(k); v != "" {
