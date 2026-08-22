@@ -1,13 +1,13 @@
 module github.com/techfish-11/discord-wordcloud
 
-go 1.22
+go 1.25.0
 
 require (
 	github.com/bwmarrin/discordgo v0.28.1
 	github.com/ikawaha/kagome-dict/ipa v1.2.0
 	github.com/ikawaha/kagome/v2 v2.9.11
-	golang.org/x/image v0.24.0
-	golang.org/x/text v0.22.0
+	golang.org/x/image v0.41.0
+	golang.org/x/text v0.37.0
 	modernc.org/sqlite v1.34.5
 )
 
