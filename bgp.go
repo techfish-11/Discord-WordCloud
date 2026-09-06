@@ -135,20 +135,58 @@ func (a *App) handleASCommand(s *discordgo.Session, i *discordgo.InteractionCrea
 			respond(s, i, "通知先チャンネルを指定してください。", true)
 			return
 		}
-		channel := op.Options[0].ChannelValue(s)
-		if channel == nil || channel.GuildID != i.GuildID || channel.Type != discordgo.ChannelTypeGuildText {
-			respond(s, i, "このサーバーのテキストチャンネルを指定してください。", true)
+		channel, err := resolveBGPNotificationChannel(s, i, op.Options[0])
+		if err != nil {
+			log.Printf("resolve BGP channel for guild %s: %v", i.GuildID, err)
+			respond(s, i, "指定されたチャンネルまたはスレッドを確認できませんでした。Botが閲覧できる場所を指定してください。", true)
 			return
 		}
-		_, err := a.db.Exec(`INSERT INTO bgp_settings(guild_id,channel_id,updated_at) VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,updated_at=excluded.updated_at`, i.GuildID, channel.ID, time.Now().Unix())
+		if (channel.GuildID != "" && channel.GuildID != i.GuildID) || !isBGPNotificationChannel(channel.Type) {
+			respond(s, i, "このサーバーのテキストチャンネル、またはスレッドを指定してください。", true)
+			return
+		}
+		_, err = a.db.Exec(`INSERT INTO bgp_settings(guild_id,channel_id,updated_at) VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id,updated_at=excluded.updated_at`, i.GuildID, channel.ID, time.Now().Unix())
 		if err != nil {
 			log.Printf("set BGP channel for guild %s: %v", i.GuildID, err)
 			respond(s, i, "通知先の保存に失敗しました。", true)
 			return
 		}
-		respond(s, i, fmt.Sprintf("経路変更のお知らせを<#%s>へ送るように設定しました。", channel.ID), false)
+		respond(s, i, fmt.Sprintf("経路変更のお知らせを<#%s>へ送るように設定しました。非公開スレッドの場合は、Botがそのスレッドに参加していることを確認してください。", channel.ID), false)
 	default:
 		respond(s, i, "不明なサブコマンドです。", true)
+	}
+}
+
+func resolveBGPNotificationChannel(s *discordgo.Session, i *discordgo.InteractionCreate, option *discordgo.ApplicationCommandInteractionDataOption) (*discordgo.Channel, error) {
+	if option == nil || option.Type != discordgo.ApplicationCommandOptionChannel {
+		return nil, fmt.Errorf("notification option is not a channel")
+	}
+	channelID := option.ChannelValue(nil).ID
+	data := i.ApplicationCommandData()
+	if data.Resolved != nil {
+		if channel := data.Resolved.Channels[channelID]; channel != nil {
+			return channel, nil
+		}
+	}
+	if channel, err := s.State.Channel(channelID); err == nil {
+		return channel, nil
+	}
+	channel, err := s.Channel(channelID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch channel %s: %w", channelID, err)
+	}
+	return channel, nil
+}
+
+func isBGPNotificationChannel(channelType discordgo.ChannelType) bool {
+	switch channelType {
+	case discordgo.ChannelTypeGuildText,
+		discordgo.ChannelTypeGuildNewsThread,
+		discordgo.ChannelTypeGuildPublicThread,
+		discordgo.ChannelTypeGuildPrivateThread:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -158,27 +196,36 @@ func (a *App) bgpNotifier(ctx context.Context, s *discordgo.Session) {
 		case <-ctx.Done():
 			return
 		case event := <-a.bgpEvents:
-			channels, err := a.notificationChannels(event)
+			targets, err := a.notificationTargets(event)
 			if err != nil {
 				log.Printf("resolve BGP notification channels: %v", err)
 				continue
 			}
+			if err := a.recordChangedASes(ctx, targets, time.Now().In(a.loc).Format("2006-01-02")); err != nil {
+				log.Printf("record daily BGP changes: %v", err)
+			}
 			embed := formatBGPEventEmbed(event)
-			for _, channelID := range channels {
-				if _, err := s.ChannelMessageSendEmbed(channelID, embed); err != nil {
-					log.Printf("send BGP notification to channel %s: %v", channelID, err)
+			for _, target := range targets {
+				if _, err := s.ChannelMessageSendEmbed(target.channelID, embed); err != nil {
+					log.Printf("send BGP notification to channel %s: %v", target.channelID, err)
 				}
 			}
 		}
 	}
 }
 
-func (a *App) notificationChannels(event bgpmonitor.Event) ([]string, error) {
+type bgpNotificationTarget struct {
+	guildID   string
+	channelID string
+	asns      []uint32
+}
+
+func (a *App) notificationTargets(event bgpmonitor.Event) ([]bgpNotificationTarget, error) {
 	asns := eventASNs(event)
 	if len(asns) == 0 {
 		return nil, nil
 	}
-	query := `SELECT DISTINCT s.channel_id FROM bgp_settings s JOIN bgp_watched_as w ON w.guild_id=s.guild_id WHERE w.asn IN (` + strings.TrimSuffix(strings.Repeat("?,", len(asns)), ",") + `)`
+	query := `SELECT s.guild_id,s.channel_id,w.asn FROM bgp_settings s JOIN bgp_watched_as w ON w.guild_id=s.guild_id WHERE w.asn IN (` + strings.TrimSuffix(strings.Repeat("?,", len(asns)), ",") + `) ORDER BY s.guild_id,w.asn`
 	args := make([]any, len(asns))
 	for i, asn := range asns {
 		args[i] = asn
@@ -188,15 +235,45 @@ func (a *App) notificationChannels(event bgpmonitor.Event) ([]string, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var channels []string
+	targetByGuild := make(map[string]*bgpNotificationTarget)
 	for rows.Next() {
-		var channel string
-		if err := rows.Scan(&channel); err != nil {
+		var guildID, channelID string
+		var asn uint32
+		if err := rows.Scan(&guildID, &channelID, &asn); err != nil {
 			return nil, err
 		}
-		channels = append(channels, channel)
+		target := targetByGuild[guildID]
+		if target == nil {
+			target = &bgpNotificationTarget{guildID: guildID, channelID: channelID}
+			targetByGuild[guildID] = target
+		}
+		target.asns = append(target.asns, asn)
 	}
-	return channels, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	targets := make([]bgpNotificationTarget, 0, len(targetByGuild))
+	for _, target := range targetByGuild {
+		targets = append(targets, *target)
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].guildID < targets[j].guildID })
+	return targets, nil
+}
+
+func (a *App) recordChangedASes(ctx context.Context, targets []bgpNotificationTarget, day string) error {
+	tx, err := a.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, target := range targets {
+		for _, asn := range target.asns {
+			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO bgp_daily_changed_as(guild_id,day,asn) VALUES(?,?,?)`, target.guildID, day, asn); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 func eventASNs(event bgpmonitor.Event) []uint32 {
@@ -215,6 +292,125 @@ func eventASNs(event bgpmonitor.Event) []uint32 {
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
 	return values
+}
+
+func parseDailyReportTime(value string) (int, int, error) {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("BGP_DAILY_REPORT_TIME must use HH:MM format")
+	}
+	hour, errHour := strconv.Atoi(parts[0])
+	minute, errMinute := strconv.Atoi(parts[1])
+	if errHour != nil || errMinute != nil || len(parts[0]) != 2 || len(parts[1]) != 2 || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, 0, fmt.Errorf("BGP_DAILY_REPORT_TIME must be a valid 24-hour time in HH:MM format")
+	}
+	return hour, minute, nil
+}
+
+func (a *App) bgpDailyReporter(ctx context.Context, s *discordgo.Session) {
+	// Check at startup so a restart shortly after the scheduled time does not
+	// skip the report. Subsequent checks also retry transient Discord failures.
+	a.sendDueDailyReports(ctx, s, time.Now().In(a.loc))
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			a.sendDueDailyReports(ctx, s, now.In(a.loc))
+		}
+	}
+}
+
+func (a *App) sendDueDailyReports(ctx context.Context, s *discordgo.Session, now time.Time) {
+	scheduled := time.Date(now.Year(), now.Month(), now.Day(), a.reportHour, a.reportMinute, 0, 0, a.loc)
+	if now.Before(scheduled) {
+		scheduled = scheduled.AddDate(0, 0, -1)
+	}
+	reportDay := scheduled.AddDate(0, 0, -1).Format("2006-01-02")
+	rows, err := a.db.QueryContext(ctx, `SELECT s.guild_id,s.channel_id
+FROM bgp_settings s
+WHERE s.updated_at<=? AND NOT EXISTS (
+  SELECT 1 FROM bgp_daily_reports r WHERE r.guild_id=s.guild_id AND r.day=?
+)
+ORDER BY s.guild_id`, scheduled.Unix(), reportDay)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("load due BGP daily reports: %v", err)
+		}
+		return
+	}
+	type destination struct{ guildID, channelID string }
+	var destinations []destination
+	for rows.Next() {
+		var item destination
+		if err := rows.Scan(&item.guildID, &item.channelID); err != nil {
+			log.Printf("scan due BGP daily report: %v", err)
+			rows.Close()
+			return
+		}
+		destinations = append(destinations, item)
+	}
+	if err := rows.Close(); err != nil {
+		log.Printf("close due BGP daily reports: %v", err)
+		return
+	}
+	for _, destination := range destinations {
+		asns, err := a.changedASes(ctx, destination.guildID, reportDay)
+		if err != nil {
+			log.Printf("load changed ASes for guild %s: %v", destination.guildID, err)
+			continue
+		}
+		if _, err := s.ChannelMessageSendEmbed(destination.channelID, formatDailyBGPReportEmbed(reportDay, asns)); err != nil {
+			log.Printf("send BGP daily report to channel %s: %v", destination.channelID, err)
+			continue
+		}
+		if _, err := a.db.ExecContext(ctx, `INSERT OR IGNORE INTO bgp_daily_reports(guild_id,day,sent_at) VALUES(?,?,?)`, destination.guildID, reportDay, time.Now().Unix()); err != nil {
+			// Sending succeeded but recording failed, so a retry could duplicate the
+			// report. Log this prominently instead of silently losing that fact.
+			log.Printf("record sent BGP daily report for guild %s: %v", destination.guildID, err)
+		}
+	}
+}
+
+func (a *App) changedASes(ctx context.Context, guildID, day string) ([]uint32, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT asn FROM bgp_daily_changed_as WHERE guild_id=? AND day=? ORDER BY asn`, guildID, day)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var asns []uint32
+	for rows.Next() {
+		var asn uint32
+		if err := rows.Scan(&asn); err != nil {
+			return nil, err
+		}
+		asns = append(asns, asn)
+	}
+	return asns, rows.Err()
+}
+
+func formatDailyBGPReportEmbed(day string, asns []uint32) *discordgo.MessageEmbed {
+	values := make([]string, len(asns))
+	for i, asn := range asns {
+		values[i] = fmt.Sprintf("AS%d", asn)
+	}
+	list := "なし"
+	if len(values) > 0 {
+		list = truncateBGPField(strings.Join(values, ", "), 900)
+	}
+	return &discordgo.MessageEmbed{
+		Title:       "📊 1日のBGP経路変動まとめ",
+		Description: day + "（JST）に、監視中のASで確認された経路変動の集計です。",
+		Color:       0x5865F2,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "経路変動があったASの数", Value: fmt.Sprintf("**%d AS**", len(asns)), Inline: false},
+			{Name: "変動があったAS番号", Value: list, Inline: false},
+		},
+		Footer:    &discordgo.MessageEmbedFooter{Text: "同じASで何度変動しても、この集計では1 ASとして数えます。"},
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
 }
 
 func formatBGPEventEmbed(event bgpmonitor.Event) *discordgo.MessageEmbed {

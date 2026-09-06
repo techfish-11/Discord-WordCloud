@@ -38,13 +38,15 @@ const (
 var errNoWords = errors.New("集計対象の単語がありません")
 
 type App struct {
-	db        *sql.DB
-	loc       *time.Location
-	mu        sync.Mutex
-	fonts     map[int]font.Face
-	text      *TextAnalyzer
-	ttf       *opentype.Font
-	bgpEvents chan bgpmonitor.Event
+	db           *sql.DB
+	loc          *time.Location
+	mu           sync.Mutex
+	fonts        map[int]font.Face
+	text         *TextAnalyzer
+	ttf          *opentype.Font
+	bgpEvents    chan bgpmonitor.Event
+	reportHour   int
+	reportMinute int
 }
 
 type Word struct {
@@ -74,7 +76,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face), text: analyzer, bgpEvents: make(chan bgpmonitor.Event, 4096)}
+	reportHour, reportMinute, err := parseDailyReportTime(getenv("BGP_DAILY_REPORT_TIME", "09:00"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face), text: analyzer, bgpEvents: make(chan bgpmonitor.Event, 4096), reportHour: reportHour, reportMinute: reportMinute}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
@@ -104,6 +110,7 @@ func main() {
 	}
 	go app.scheduler(ctx, s)
 	go app.bgpNotifier(ctx, s)
+	go app.bgpDailyReporter(ctx, s)
 	log.Println("wordcloud bot and BGP monitor started")
 	<-ctx.Done()
 	log.Println("shutdown requested")
@@ -117,7 +124,10 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, guild
 CREATE INDEX IF NOT EXISTS idx_messages_channel_day ON messages(channel_id, day);
 CREATE TABLE IF NOT EXISTS bgp_settings (guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS bgp_watched_as (guild_id TEXT NOT NULL, asn INTEGER NOT NULL CHECK(asn BETWEEN 1 AND 4294967295), created_at INTEGER NOT NULL, PRIMARY KEY(guild_id, asn));
-CREATE INDEX IF NOT EXISTS idx_bgp_watched_as_asn ON bgp_watched_as(asn);`)
+CREATE INDEX IF NOT EXISTS idx_bgp_watched_as_asn ON bgp_watched_as(asn);
+CREATE TABLE IF NOT EXISTS bgp_daily_changed_as (guild_id TEXT NOT NULL, day TEXT NOT NULL, asn INTEGER NOT NULL CHECK(asn BETWEEN 1 AND 4294967295), PRIMARY KEY(guild_id, day, asn));
+CREATE INDEX IF NOT EXISTS idx_bgp_daily_changed_as_day ON bgp_daily_changed_as(day);
+CREATE TABLE IF NOT EXISTS bgp_daily_reports (guild_id TEXT NOT NULL, day TEXT NOT NULL, sent_at INTEGER NOT NULL, PRIMARY KEY(guild_id, day));`)
 	return err
 }
 
@@ -152,7 +162,7 @@ func (a *App) onReady(s *discordgo.Session, _ *discordgo.Ready) {
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "add", Description: "監視したいAS番号を追加します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionInteger, Name: "asn", Description: "監視するAS番号（例: 65001）", Required: true, MinValue: floatPtr(1), MaxValue: 4294967295}}},
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "remove", Description: "AS番号を監視対象から外します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionInteger, Name: "asn", Description: "監視をやめるAS番号", Required: true, MinValue: floatPtr(1), MaxValue: 4294967295}}},
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "list", Description: "現在監視しているAS番号を確認します"},
-				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "notify-channel-set", Description: "経路変更のお知らせを送るチャンネルを設定します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionChannel, Name: "channel", Description: "お知らせを受け取るテキストチャンネル", Required: true, ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildText}}}},
+				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "notify-channel-set", Description: "経路変更のお知らせを送るチャンネルまたはスレッドを設定します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionChannel, Name: "channel", Description: "お知らせを受け取るチャンネルまたはスレッド", Required: true, ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildText, discordgo.ChannelTypeGuildNewsThread, discordgo.ChannelTypeGuildPublicThread, discordgo.ChannelTypeGuildPrivateThread}}}},
 			},
 		},
 	})
