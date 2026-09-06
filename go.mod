@@ -1,6 +1,6 @@
 module github.com/techfish-11/discord-wordcloud
 
-go 1.22.7
+go 1.25.0
 
 require (
 	github.com/bwmarrin/discordgo v0.28.1
@@ -8,7 +8,7 @@ require (
 	github.com/ikawaha/kagome/v2 v2.9.11
 	github.com/osrg/gobgp/v3 v3.35.0
 	golang.org/x/image v0.24.0
-	golang.org/x/text v0.22.0
+	golang.org/x/text v0.37.0
 	google.golang.org/protobuf v1.33.0
 	modernc.org/sqlite v1.34.5
 )
@@ -40,9 +40,9 @@ require (
 	github.com/subosito/gotenv v1.4.2 // indirect
 	github.com/vishvananda/netlink v1.2.1 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
-	golang.org/x/crypto v0.31.0 // indirect
-	golang.org/x/net v0.33.0 // indirect
-	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/crypto v0.51.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230525234030-28d5490b6b19 // indirect
 	google.golang.org/grpc v1.56.3 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
