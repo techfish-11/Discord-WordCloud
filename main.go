@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	_ "embed"
 	"errors"
@@ -14,12 +15,15 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/techfish-11/discord-wordcloud/bgpmonitor"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
@@ -34,12 +38,13 @@ const (
 var errNoWords = errors.New("集計対象の単語がありません")
 
 type App struct {
-	db    *sql.DB
-	loc   *time.Location
-	mu    sync.Mutex
-	fonts map[int]font.Face
-	text  *TextAnalyzer
-	ttf   *opentype.Font
+	db        *sql.DB
+	loc       *time.Location
+	mu        sync.Mutex
+	fonts     map[int]font.Face
+	text      *TextAnalyzer
+	ttf       *opentype.Font
+	bgpEvents chan bgpmonitor.Event
 }
 
 type Word struct {
@@ -69,7 +74,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face), text: analyzer}
+	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face), text: analyzer, bgpEvents: make(chan bgpmonitor.Event, 4096)}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
@@ -87,16 +92,32 @@ func main() {
 		log.Fatal(err)
 	}
 	defer s.Close()
-	log.Println("wordcloud bot started")
-	go app.scheduler(s)
-	select {}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	monitor, err := newBGPMonitor(ctx, app)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := monitor.Start(ctx); err != nil {
+		log.Fatal(err)
+	}
+	go app.scheduler(ctx, s)
+	go app.bgpNotifier(ctx, s)
+	log.Println("wordcloud bot and BGP monitor started")
+	<-ctx.Done()
+	log.Println("shutdown requested")
+	monitor.Shutdown()
 }
 
 func initDB(db *sql.DB) error {
 	_, err := db.Exec(`PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS settings (guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_id TEXT UNIQUE NOT NULL, day TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS idx_messages_channel_day ON messages(channel_id, day);`)
+CREATE INDEX IF NOT EXISTS idx_messages_channel_day ON messages(channel_id, day);
+CREATE TABLE IF NOT EXISTS bgp_settings (guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS bgp_watched_as (guild_id TEXT NOT NULL, asn INTEGER NOT NULL CHECK(asn BETWEEN 1 AND 4294967295), created_at INTEGER NOT NULL, PRIMARY KEY(guild_id, asn));
+CREATE INDEX IF NOT EXISTS idx_bgp_watched_as_asn ON bgp_watched_as(asn);`)
 	return err
 }
 
@@ -123,6 +144,15 @@ func (a *App) onReady(s *discordgo.Session, _ *discordgo.Ready) {
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "status", Description: "現在の設定を表示します"},
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "preview", Description: "今日の暫定ワードクラウドを生成します"},
 				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "disable", Description: "記録を停止します"},
+			},
+		},
+		{
+			Name: "as", Description: "インターネット経路を発信元ASごとに監視します",
+			Options: []*discordgo.ApplicationCommandOption{
+				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "add", Description: "監視したいAS番号を追加します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionInteger, Name: "asn", Description: "監視するAS番号（例: 65001）", Required: true, MinValue: floatPtr(1), MaxValue: 4294967295}}},
+				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "remove", Description: "AS番号を監視対象から外します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionInteger, Name: "asn", Description: "監視をやめるAS番号", Required: true, MinValue: floatPtr(1), MaxValue: 4294967295}}},
+				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "list", Description: "現在監視しているAS番号を確認します"},
+				{Type: discordgo.ApplicationCommandOptionSubCommand, Name: "notify-channel-set", Description: "経路変更のお知らせを送るチャンネルを設定します", Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionChannel, Name: "channel", Description: "お知らせを受け取るテキストチャンネル", Required: true, ChannelTypes: []discordgo.ChannelType{discordgo.ChannelTypeGuildText}}}},
 			},
 		},
 	})
@@ -156,6 +186,13 @@ func (a *App) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 	}
 	if !hasManageMessages(i.Member) {
 		respond(s, i, "この設定を変更するにはメッセージの管理権限が必要だよ", true)
+		return
+	}
+	if i.ApplicationCommandData().Name == "as" {
+		a.handleASCommand(s, i)
+		return
+	}
+	if i.ApplicationCommandData().Name != "wordcloud" {
 		return
 	}
 	options := i.ApplicationCommandData().Options
@@ -226,11 +263,17 @@ func (a *App) preview(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	})
 }
 
-func (a *App) scheduler(s *discordgo.Session) {
+func (a *App) scheduler(ctx context.Context, s *discordgo.Session) {
 	for {
 		now := time.Now().In(a.loc)
 		next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 5, 0, a.loc)
-		time.Sleep(time.Until(next))
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 		yesterday := next.AddDate(0, 0, -1).Format("2006-01-02")
 		rows, err := a.db.Query(`SELECT guild_id,channel_id FROM settings`)
 		if err != nil {
@@ -522,3 +565,5 @@ func getenv(k, d string) string {
 	}
 	return d
 }
+
+func floatPtr(v float64) *float64 { return &v }

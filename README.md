@@ -49,3 +49,27 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+## BGP route monitoring
+
+The bot embeds GoBGP v3 and, by default, establishes an IPv6-unicast-only
+iBGP session from `192.168.1.5` (AS65010) to `192.168.1.4` (AS65010). It does
+not listen on TCP/179 and installs a default-reject export policy, so it never
+advertises routes. The initial table (and every table received after a
+reconnect) is used as a baseline until IPv6 End-of-RIB is received.
+
+Discord commands (Manage Messages permission required):
+
+- `/as add asn:<ASN>`
+- `/as remove asn:<ASN>`
+- `/as list`
+- `/as notify-channel-set channel:<channel>`
+
+The watched ASNs and notification channel are stored in the same SQLite file
+as the word-cloud settings. Optional environment overrides are
+`BGP_LOCAL_ADDRESS`, `BGP_ROUTER_ID`, `BGP_LOCAL_ASN`,
+`BGP_NEIGHBOR_ADDRESS`, and `BGP_NEIGHBOR_ASN`.
+
+VyOS must allow the session from `192.168.1.5`, activate IPv6 Unicast for the
+neighbor, and export the desired IPv6 full table. TCP port 179 must be
+reachable from the bot host.
