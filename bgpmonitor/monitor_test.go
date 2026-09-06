@@ -36,12 +36,37 @@ func TestInitialRIBIsBaselineAndSubsequentChangesEmit(t *testing.T) {
 
 func TestResetSuppressesReconnectTable(t *testing.T) {
 	var events []Event
-	m := &Monitor{onEvent: func(event Event) { events = append(events, event) }, rib: make(map[netip.Prefix]Route), baseline: true}
+	m := &Monitor{onEvent: func(event Event) { events = append(events, event) }, rib: make(map[netip.Prefix]Route), readyIPv6: true}
 	m.handlePath(testPath(t, "2001:db8::/32", []uint32{65001}, false))
 	m.resetBaseline()
 	m.handlePath(testPath(t, "2001:db8::/32", []uint32{65001}, false))
 	if len(events) != 1 {
 		t.Fatalf("reconnect baseline emitted an event: %#v", events)
+	}
+}
+
+func TestIPv4BaselineAndChanges(t *testing.T) {
+	var events []Event
+	m := &Monitor{onEvent: func(event Event) { events = append(events, event) }, rib: make(map[netip.Prefix]Route)}
+	m.handlePath(testPath(t, "192.0.2.0/24", []uint32{64500, 65001}, false))
+	if len(events) != 0 {
+		t.Fatalf("initial IPv4 route emitted %d events", len(events))
+	}
+	m.handleResponse(&api.WatchEventResponse{Event: &api.WatchEventResponse_Table{Table: &api.WatchEventResponse_TableEvent{Paths: []*api.Path{{Family: ipv4Family()}}}}})
+	m.handlePath(testPath(t, "198.51.100.0/24", []uint32{64500, 65002}, false))
+	if len(events) != 1 || events[0].Type != Announce || !events[0].New.Prefix.Addr().Is4() {
+		t.Fatalf("unexpected IPv4 events: %#v", events)
+	}
+}
+
+func TestAddressFamilyBaselinesAreIndependent(t *testing.T) {
+	var events []Event
+	m := &Monitor{onEvent: func(event Event) { events = append(events, event) }, rib: make(map[netip.Prefix]Route)}
+	m.handleResponse(&api.WatchEventResponse{Event: &api.WatchEventResponse_Table{Table: &api.WatchEventResponse_TableEvent{Paths: []*api.Path{{Family: ipv4Family()}}}}})
+	m.handlePath(testPath(t, "198.51.100.0/24", []uint32{65001}, false))
+	m.handlePath(testPath(t, "2001:db8::/32", []uint32{65001}, false))
+	if len(events) != 1 || !events[0].New.Prefix.Addr().Is4() {
+		t.Fatalf("IPv6 emitted before its EOR: %#v", events)
 	}
 }
 
@@ -77,7 +102,11 @@ func testPath(t *testing.T, prefix string, asns []uint32, withdraw bool) *api.Pa
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := &api.Path{Family: ipv6Family(), Nlri: nlri, IsWithdraw: withdraw}
+	family := ipv6Family()
+	if netip.MustParsePrefix(prefix).Addr().Is4() {
+		family = ipv4Family()
+	}
+	path := &api.Path{Family: family, Nlri: nlri, IsWithdraw: withdraw}
 	if asns != nil {
 		attr, err := anypb.New(&api.AsPathAttribute{Segments: []*api.AsSegment{{Type: api.AsSegment_AS_SEQUENCE, Numbers: asns}}})
 		if err != nil {
@@ -90,4 +119,8 @@ func testPath(t *testing.T, prefix string, asns []uint32, withdraw bool) *api.Pa
 
 func ipv6Family() *api.Family {
 	return &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}
+}
+
+func ipv4Family() *api.Family {
+	return &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}
 }

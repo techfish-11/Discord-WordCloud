@@ -1,5 +1,5 @@
-// Package bgpmonitor embeds GoBGP and emits changes to received IPv6-unicast
-// routes after the initial RIB has reached End-of-RIB.
+// Package bgpmonitor embeds GoBGP and emits changes to received IPv4- and
+// IPv6-unicast routes after each family's initial RIB reaches End-of-RIB.
 package bgpmonitor
 
 import (
@@ -43,9 +43,10 @@ type Monitor struct {
 	server   *server.BgpServer
 	stopOnce sync.Once
 
-	mu       sync.Mutex
-	rib      map[netip.Prefix]Route
-	baseline bool
+	mu        sync.Mutex
+	rib       map[netip.Prefix]Route
+	readyIPv4 bool
+	readyIPv6 bool
 }
 
 func New(config Config, onEvent func(Event)) (*Monitor, error) {
@@ -102,7 +103,10 @@ func (m *Monitor) Start(ctx context.Context) error {
 	peer := &api.Peer{
 		Conf:      &api.PeerConf{NeighborAddress: m.config.NeighborAddress, PeerAsn: m.config.NeighborASN, LocalAsn: m.config.LocalASN},
 		Transport: &api.Transport{LocalAddress: m.config.LocalAddress},
-		AfiSafis:  []*api.AfiSafi{{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}, Enabled: true}}},
+		AfiSafis: []*api.AfiSafi{
+			{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP, Safi: api.Family_SAFI_UNICAST}, Enabled: true}},
+			{Config: &api.AfiSafiConfig{Family: &api.Family{Afi: api.Family_AFI_IP6, Safi: api.Family_SAFI_UNICAST}, Enabled: true}},
+		},
 	}
 	if err := m.server.AddPeer(ctx, &api.AddPeerRequest{Peer: peer}); err != nil {
 		m.stop()
@@ -148,27 +152,35 @@ func (m *Monitor) handleResponse(response *api.WatchEventResponse) {
 		return
 	}
 	for _, path := range tableEvent.Paths {
-		if isIPv6EOR(path) {
+		if isUnicastEOR(path) {
 			m.mu.Lock()
-			m.baseline = true
+			if path.Family.Afi == api.Family_AFI_IP {
+				m.readyIPv4 = true
+			} else {
+				m.readyIPv6 = true
+			}
 			count := len(m.rib)
 			m.mu.Unlock()
-			log.Printf("BGP IPv6 baseline ready with %d routes", count)
+			log.Printf("BGP %s baseline ready (%d total routes in RIB)", path.Family.Afi, count)
 			continue
 		}
 		m.handlePath(path)
 	}
 }
 
-func isIPv6EOR(path *api.Path) bool {
-	return path != nil && path.Nlri == nil && path.Family != nil &&
-		path.Family.Afi == api.Family_AFI_IP6 && path.Family.Safi == api.Family_SAFI_UNICAST
+func isUnicastEOR(path *api.Path) bool {
+	if path == nil || path.Nlri != nil {
+		return false
+	}
+	_, err := apiRouteFamily(path.Family)
+	return err == nil
 }
 
 func (m *Monitor) resetBaseline() {
 	m.mu.Lock()
 	m.rib = make(map[netip.Prefix]Route)
-	m.baseline = false
+	m.readyIPv4 = false
+	m.readyIPv6 = false
 	m.mu.Unlock()
 }
 
@@ -185,7 +197,10 @@ func (m *Monitor) handlePath(path *api.Path) {
 
 	m.mu.Lock()
 	old, existed := m.rib[route.Prefix]
-	active := m.baseline
+	active := m.readyIPv6
+	if route.Prefix.Addr().Is4() {
+		active = m.readyIPv4
+	}
 	if path.IsWithdraw {
 		delete(m.rib, route.Prefix)
 	} else {
@@ -216,7 +231,10 @@ func (m *Monitor) handleBareWithdraw(path *api.Path) {
 	}
 	m.mu.Lock()
 	old, existed := m.rib[prefix]
-	active := m.baseline
+	active := m.readyIPv6
+	if prefix.Addr().Is4() {
+		active = m.readyIPv4
+	}
 	delete(m.rib, prefix)
 	m.mu.Unlock()
 	if active && existed {

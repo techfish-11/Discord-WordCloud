@@ -49,18 +49,33 @@ func prefixFromAPI(path *api.Path) (netip.Prefix, error) {
 	if path == nil || path.Nlri == nil {
 		return netip.Prefix{}, fmt.Errorf("path has no NLRI")
 	}
-	if path.Family == nil || path.Family.Afi != api.Family_AFI_IP6 || path.Family.Safi != api.Family_SAFI_UNICAST {
-		return netip.Prefix{}, fmt.Errorf("path is not IPv6 unicast")
+	routeFamily, err := apiRouteFamily(path.Family)
+	if err != nil {
+		return netip.Prefix{}, err
 	}
-	nlri, err := apiutil.UnmarshalNLRI(bgp.RF_IPv6_UC, path.Nlri)
+	nlri, err := apiutil.UnmarshalNLRI(routeFamily, path.Nlri)
 	if err != nil {
 		return netip.Prefix{}, fmt.Errorf("decode NLRI: %w", err)
 	}
 	prefix, err := netip.ParsePrefix(nlri.String())
-	if err != nil || !prefix.Addr().Is6() {
-		return netip.Prefix{}, fmt.Errorf("invalid IPv6 prefix %q", nlri.String())
+	if err != nil || (path.Family.Afi == api.Family_AFI_IP && !prefix.Addr().Is4()) || (path.Family.Afi == api.Family_AFI_IP6 && !prefix.Addr().Is6()) {
+		return netip.Prefix{}, fmt.Errorf("invalid unicast prefix %q", nlri.String())
 	}
 	return prefix.Masked(), nil
+}
+
+func apiRouteFamily(family *api.Family) (bgp.RouteFamily, error) {
+	if family == nil || family.Safi != api.Family_SAFI_UNICAST {
+		return 0, fmt.Errorf("path is not IP unicast")
+	}
+	switch family.Afi {
+	case api.Family_AFI_IP:
+		return bgp.RF_IPv4_UC, nil
+	case api.Family_AFI_IP6:
+		return bgp.RF_IPv6_UC, nil
+	default:
+		return 0, fmt.Errorf("unsupported address family %s", family.Afi)
+	}
 }
 
 func formatASPath(segments []bgp.AsPathParamInterface) (string, uint32, bool) {

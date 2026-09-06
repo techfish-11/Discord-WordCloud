@@ -52,11 +52,12 @@ WantedBy=multi-user.target
 
 ## BGP route monitoring
 
-The bot embeds GoBGP v3 and, by default, establishes an IPv6-unicast-only
+The bot embeds GoBGP v3 and, by default, establishes an IPv4/IPv6-unicast
 iBGP session from `192.168.1.5` (AS65010) to `192.168.1.4` (AS65010). It does
 not listen on TCP/179 and installs a default-reject export policy, so it never
 advertises routes. The initial table (and every table received after a
-reconnect) is used as a baseline until IPv6 End-of-RIB is received.
+reconnect) is used as a baseline independently for each family until its
+End-of-RIB is received.
 
 Discord commands (Manage Messages permission required):
 
@@ -77,6 +78,6 @@ counts. Set `BGP_DAILY_REPORT_TIME=HH:MM` to change the delivery time. Daily
 counters and sent-report markers are persisted in SQLite, so a restart does
 not reset the count or normally duplicate a report.
 
-VyOS must allow the session from `192.168.1.5`, activate IPv6 Unicast for the
-neighbor, and export the desired IPv6 full table. TCP port 179 must be
+VyOS must allow the session from `192.168.1.5`, activate IPv4 Unicast and IPv6
+Unicast for the neighbor, and export the desired full tables. TCP port 179 must be
 reachable from the bot host.
