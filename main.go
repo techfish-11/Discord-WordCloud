@@ -125,10 +125,44 @@ CREATE INDEX IF NOT EXISTS idx_messages_channel_day ON messages(channel_id, day)
 CREATE TABLE IF NOT EXISTS bgp_settings (guild_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, updated_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS bgp_watched_as (guild_id TEXT NOT NULL, asn INTEGER NOT NULL CHECK(asn BETWEEN 1 AND 4294967295), created_at INTEGER NOT NULL, PRIMARY KEY(guild_id, asn));
 CREATE INDEX IF NOT EXISTS idx_bgp_watched_as_asn ON bgp_watched_as(asn);
-CREATE TABLE IF NOT EXISTS bgp_daily_changed_as (guild_id TEXT NOT NULL, day TEXT NOT NULL, asn INTEGER NOT NULL CHECK(asn BETWEEN 1 AND 4294967295), PRIMARY KEY(guild_id, day, asn));
+CREATE TABLE IF NOT EXISTS bgp_daily_changed_as (guild_id TEXT NOT NULL, day TEXT NOT NULL, asn INTEGER NOT NULL CHECK(asn BETWEEN 1 AND 4294967295), change_count INTEGER NOT NULL DEFAULT 1 CHECK(change_count >= 1), PRIMARY KEY(guild_id, day, asn));
 CREATE INDEX IF NOT EXISTS idx_bgp_daily_changed_as_day ON bgp_daily_changed_as(day);
 CREATE TABLE IF NOT EXISTS bgp_daily_reports (guild_id TEXT NOT NULL, day TEXT NOT NULL, sent_at INTEGER NOT NULL, PRIMARY KEY(guild_id, day));`)
-	return err
+	if err != nil {
+		return err
+	}
+	return ensureSQLiteColumn(db, "bgp_daily_changed_as", "change_count", `ALTER TABLE bgp_daily_changed_as ADD COLUMN change_count INTEGER NOT NULL DEFAULT 1 CHECK(change_count >= 1)`)
+}
+
+func ensureSQLiteColumn(db *sql.DB, table, column, alterStatement string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("inspect column in %s: %w", table, err)
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close table inspection for %s: %w", table, err)
+	}
+	if found {
+		return nil
+	}
+	if _, err := db.Exec(alterStatement); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func (a *App) onReady(s *discordgo.Session, _ *discordgo.Ready) {

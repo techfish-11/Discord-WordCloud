@@ -268,7 +268,8 @@ func (a *App) recordChangedASes(ctx context.Context, targets []bgpNotificationTa
 	defer tx.Rollback()
 	for _, target := range targets {
 		for _, asn := range target.asns {
-			if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO bgp_daily_changed_as(guild_id,day,asn) VALUES(?,?,?)`, target.guildID, day, asn); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO bgp_daily_changed_as(guild_id,day,asn,change_count) VALUES(?,?,?,1)
+ON CONFLICT(guild_id,day,asn) DO UPDATE SET change_count=bgp_daily_changed_as.change_count+1`, target.guildID, day, asn); err != nil {
 				return err
 			}
 		}
@@ -357,12 +358,12 @@ ORDER BY s.guild_id`, scheduled.Unix(), reportDay)
 		return
 	}
 	for _, destination := range destinations {
-		asns, err := a.changedASes(ctx, destination.guildID, reportDay)
+		changes, err := a.changedASes(ctx, destination.guildID, reportDay)
 		if err != nil {
 			log.Printf("load changed ASes for guild %s: %v", destination.guildID, err)
 			continue
 		}
-		if _, err := s.ChannelMessageSendEmbed(destination.channelID, formatDailyBGPReportEmbed(reportDay, asns)); err != nil {
+		if _, err := s.ChannelMessageSendEmbed(destination.channelID, formatDailyBGPReportEmbed(reportDay, changes)); err != nil {
 			log.Printf("send BGP daily report to channel %s: %v", destination.channelID, err)
 			continue
 		}
@@ -374,27 +375,36 @@ ORDER BY s.guild_id`, scheduled.Unix(), reportDay)
 	}
 }
 
-func (a *App) changedASes(ctx context.Context, guildID, day string) ([]uint32, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT asn FROM bgp_daily_changed_as WHERE guild_id=? AND day=? ORDER BY asn`, guildID, day)
+type dailyASChange struct {
+	ASN   uint32
+	Count uint64
+}
+
+func (a *App) changedASes(ctx context.Context, guildID, day string) ([]dailyASChange, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT asn,change_count FROM bgp_daily_changed_as WHERE guild_id=? AND day=? ORDER BY change_count DESC,asn ASC`, guildID, day)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var asns []uint32
+	var changes []dailyASChange
 	for rows.Next() {
-		var asn uint32
-		if err := rows.Scan(&asn); err != nil {
+		var change dailyASChange
+		if err := rows.Scan(&change.ASN, &change.Count); err != nil {
 			return nil, err
 		}
-		asns = append(asns, asn)
+		changes = append(changes, change)
 	}
-	return asns, rows.Err()
+	return changes, rows.Err()
 }
 
-func formatDailyBGPReportEmbed(day string, asns []uint32) *discordgo.MessageEmbed {
-	values := make([]string, len(asns))
-	for i, asn := range asns {
-		values[i] = fmt.Sprintf("AS%d", asn)
+func formatDailyBGPReportEmbed(day string, changes []dailyASChange) *discordgo.MessageEmbed {
+	topCount := len(changes)
+	if topCount > 5 {
+		topCount = 5
+	}
+	values := make([]string, topCount)
+	for i := 0; i < topCount; i++ {
+		values[i] = fmt.Sprintf("**%d位**　AS%d — %d回", i+1, changes[i].ASN, changes[i].Count)
 	}
 	list := "なし"
 	if len(values) > 0 {
@@ -405,10 +415,10 @@ func formatDailyBGPReportEmbed(day string, asns []uint32) *discordgo.MessageEmbe
 		Description: day + "（JST）に、監視中のASで確認された経路変動の集計です。",
 		Color:       0x5865F2,
 		Fields: []*discordgo.MessageEmbedField{
-			{Name: "経路変動があったASの数", Value: fmt.Sprintf("**%d AS**", len(asns)), Inline: false},
-			{Name: "変動があったAS番号", Value: list, Inline: false},
+			{Name: "経路変動があったASの数", Value: fmt.Sprintf("**%d AS**", len(changes)), Inline: false},
+			{Name: "経路変動回数トップ5", Value: list, Inline: false},
 		},
-		Footer:    &discordgo.MessageEmbedFooter{Text: "同じASで何度変動しても、この集計では1 ASとして数えます。"},
+		Footer:    &discordgo.MessageEmbedFooter{Text: "announce・withdraw・AS_PATH変更を、それぞれ1回の変動として数えます。"},
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
 }

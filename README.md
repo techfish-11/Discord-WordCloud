@@ -72,9 +72,10 @@ as the word-cloud settings. Optional environment overrides are
 
 At `09:00` JST each day, every configured notification channel or thread also
 receives a summary of how many distinct monitored ASNs had a route change on
-the previous day. Set `BGP_DAILY_REPORT_TIME=HH:MM` to change the delivery
-time. Daily counters and sent-report markers are persisted in SQLite, so a
-restart does not reset the count or normally duplicate a report.
+the previous day, plus the five ASNs with the most changes and their change
+counts. Set `BGP_DAILY_REPORT_TIME=HH:MM` to change the delivery time. Daily
+counters and sent-report markers are persisted in SQLite, so a restart does
+not reset the count or normally duplicate a report.
 
 VyOS must allow the session from `192.168.1.5`, activate IPv6 Unicast for the
 neighbor, and export the desired IPv6 full table. TCP port 179 must be

@@ -84,7 +84,7 @@ func TestDailyReportTimeValidation(t *testing.T) {
 	}
 }
 
-func TestDailyChangedASesAreDeduplicated(t *testing.T) {
+func TestDailyChangedASesAreCounted(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:bgp-daily-test?mode=memory&cache=shared")
 	if err != nil {
 		t.Fatal(err)
@@ -98,15 +98,40 @@ func TestDailyChangedASesAreDeduplicated(t *testing.T) {
 	if err := app.recordChangedASes(context.Background(), targets, "2026-09-06"); err != nil {
 		t.Fatal(err)
 	}
-	asns, err := app.changedASes(context.Background(), "guild", "2026-09-06")
+	changes, err := app.changedASes(context.Background(), "guild", "2026-09-06")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(asns) != 2 || asns[0] != 65001 || asns[1] != 65002 {
-		t.Fatalf("changed ASes = %v, want [65001 65002]", asns)
+	if len(changes) != 2 || changes[0] != (dailyASChange{ASN: 65001, Count: 2}) || changes[1] != (dailyASChange{ASN: 65002, Count: 1}) {
+		t.Fatalf("changed ASes = %#v", changes)
 	}
-	embed := formatDailyBGPReportEmbed("2026-09-06", asns)
-	if !strings.Contains(embed.Fields[0].Value, "2 AS") {
+	embed := formatDailyBGPReportEmbed("2026-09-06", changes)
+	if !strings.Contains(embed.Fields[0].Value, "2 AS") || !strings.Contains(embed.Fields[1].Value, "AS65001 — 2回") {
 		t.Fatalf("daily embed has wrong count: %#v", embed)
+	}
+}
+
+func TestDailyReportShowsOnlyTopFive(t *testing.T) {
+	changes := []dailyASChange{{ASN: 1, Count: 9}, {ASN: 2, Count: 8}, {ASN: 3, Count: 7}, {ASN: 4, Count: 6}, {ASN: 5, Count: 5}, {ASN: 6, Count: 4}}
+	embed := formatDailyBGPReportEmbed("2026-09-06", changes)
+	if strings.Contains(embed.Fields[1].Value, "AS6") || !strings.Contains(embed.Fields[1].Value, "AS5") {
+		t.Fatalf("top-five field = %q", embed.Fields[1].Value)
+	}
+}
+
+func TestInitDBMigratesLegacyDailyChangeTable(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:bgp-daily-migration-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE bgp_daily_changed_as (guild_id TEXT NOT NULL, day TEXT NOT NULL, asn INTEGER NOT NULL, PRIMARY KEY(guild_id,day,asn))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := initDB(db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO bgp_daily_changed_as(guild_id,day,asn,change_count) VALUES('g','2026-09-06',65001,2)`); err != nil {
+		t.Fatalf("migrated change_count column is unavailable: %v", err)
 	}
 }
