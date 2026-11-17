@@ -9,7 +9,121 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 )
+
+func TestCallSenderName(t *testing.T) {
+	user := &discordgo.User{Username: "account-name", GlobalName: "表示名"}
+	for _, tt := range []struct {
+		name   string
+		member *discordgo.Member
+		want   string
+	}{
+		{"nickname", &discordgo.Member{Nick: "サーバー名", User: user}, "サーバー名"},
+		{"display name", &discordgo.Member{User: user}, "表示名"},
+		{"username", &discordgo.Member{User: &discordgo.User{Username: "account-name"}}, "account-name"},
+		{"blank nickname", &discordgo.Member{Nick: " \n", User: user}, "表示名"},
+		{"control characters", &discordgo.Member{Nick: "名前\x00\nです", User: user}, "名前 です"},
+		{"missing user", nil, "Discordユーザー"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := callSenderName(tt.member); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+type callTestPhone struct {
+	call func(context.Context, []byte, func(string)) (string, error)
+}
+
+func (p callTestPhone) Ready() bool { return true }
+func (p callTestPhone) Close()      {}
+func (p callTestPhone) Call(ctx context.Context, wav []byte, update func(string)) (string, error) {
+	return p.call(ctx, wav, update)
+}
+
+func TestCallPublicResponseAndSpokenSender(t *testing.T) {
+	for _, scenario := range []string{"success", "invalid message", "denied"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// Keep this test inside the allowed hours regardless of the wall clock.
+			location := time.FixedZone("test daytime", (12-time.Now().UTC().Hour())*3600)
+			c := &callService{ctx: ctx, cancel: cancel, last: make(map[string]time.Time), cfg: callConfig{location: location, quietStart: 23, quietEnd: 6, concurrency: 1, cooldown: time.Minute, totalTimeout: time.Second}}
+			if scenario == "denied" {
+				c.cfg.users = map[string]bool{"another-user": true}
+			}
+			ttsCalls, phoneCalls := 0, 0
+			c.http = &http.Client{Transport: callRoundTripper(func(r *http.Request) (*http.Response, error) {
+				ttsCalls++
+				if strings.HasSuffix(r.URL.Path, "audio_query") {
+					var payload struct {
+						Text string `json:"text"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					if payload.Text != "サーバー名さんからのメッセージです。hello" {
+						t.Errorf("incorrect spoken sender: %q", payload.Text)
+					}
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"accent_phrases":[]}`))}, nil
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(callTestWAV(800))))}, nil
+			})}
+			c.phone = callTestPhone{call: func(_ context.Context, _ []byte, update func(string)) (string, error) {
+				phoneCalls++
+				update("発信中…")
+				update("相手が出ました。")
+				return "通話が完了しました。", nil
+			}}
+			s, err := discordgo.New("Bot test-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			callbacks, edits := 0, 0
+			s.Client = &http.Client{Transport: callRoundTripper(func(r *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(r.URL.Path, "/callback") {
+					callbacks++
+					var payload discordgo.InteractionResponse
+					if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+						t.Error(err)
+					}
+					if payload.Data != nil && payload.Data.Flags&discordgo.MessageFlagsEphemeral != 0 {
+						t.Error("response is ephemeral")
+					}
+					if scenario == "success" && payload.Type != discordgo.InteractionResponseDeferredChannelMessageWithSource {
+						t.Error("missing thinking response")
+					}
+				} else {
+					edits++
+					if r.Method != "PATCH" || !strings.HasSuffix(r.URL.Path, "/messages/@original") {
+						t.Errorf("not editing the original response: %s %s", r.Method, r.URL.Path)
+					}
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"message"}`))}, nil
+			})}
+			message := "hello"
+			if scenario == "invalid message" {
+				message = ""
+			}
+			i := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{ID: "interaction", AppID: "application", Token: "interaction-token", GuildID: "guild", Type: discordgo.InteractionApplicationCommand, Member: &discordgo.Member{Nick: "サーバー名", User: &discordgo.User{ID: "123456789012345678", GlobalName: "表示名", Username: "username"}}, Data: discordgo.ApplicationCommandInteractionData{Name: "call", Options: []*discordgo.ApplicationCommandInteractionDataOption{{Name: "message", Type: discordgo.ApplicationCommandOptionString, Value: message}}}}}
+			(&App{calls: c}).handleCall(s, i)
+			if callbacks != 1 {
+				t.Fatalf("callbacks=%d", callbacks)
+			}
+			if scenario == "success" {
+				if ttsCalls != 2 || phoneCalls != 1 || edits != 4 {
+					t.Fatalf("tts=%d calls=%d edits=%d", ttsCalls, phoneCalls, edits)
+				}
+			} else if ttsCalls != 0 || phoneCalls != 0 || edits != 0 {
+				t.Fatal("rejected command placed a call")
+			}
+		})
+	}
+}
 
 func TestCallMessageValidation(t *testing.T) {
 	for _, s := range []string{"", " \n", strings.Repeat("あ", 501), "hello\x00", string([]byte{255})} {

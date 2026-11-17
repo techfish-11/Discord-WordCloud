@@ -184,36 +184,61 @@ func validateCallMessage(message string) error {
 	return nil
 }
 
+func callSenderName(member *discordgo.Member) string {
+	if member != nil {
+		names := []string{member.Nick}
+		if member.User != nil {
+			names = append(names, member.User.GlobalName, member.User.Username)
+		}
+		for _, name := range names {
+			if !utf8.ValidString(name) {
+				continue
+			}
+			// Display names must not introduce control characters into TTS input.
+			name = strings.Map(func(r rune) rune {
+				if unicode.IsControl(r) {
+					return ' '
+				}
+				return r
+			}, name)
+			if name = strings.Join(strings.Fields(name), " "); name != "" {
+				return name
+			}
+		}
+	}
+	return "Discordユーザー"
+}
+
 func (a *App) handleCall(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if a.calls == nil {
-		respond(s, i, "音声メモ機能は無効です。", true)
+		respond(s, i, "音声メモ機能は無効です。", false)
 		return
 	}
 	if i.Member == nil || i.Member.User == nil {
-		respond(s, i, "ユーザー情報を取得できません。", true)
+		respond(s, i, "ユーザー情報を取得できません。", false)
 		return
 	}
 	opts := i.ApplicationCommandData().Options
 	if len(opts) != 1 || opts[0].Name != "message" || opts[0].Type != discordgo.ApplicationCommandOptionString {
-		respond(s, i, "messageを指定してください。", true)
+		respond(s, i, "messageを指定してください。", false)
 		return
 	}
 	message, ok := opts[0].Value.(string)
 	if !ok {
-		respond(s, i, "messageが不正です。", true)
+		respond(s, i, "messageが不正です。", false)
 		return
 	}
 	if err := validateCallMessage(message); err != nil {
-		respond(s, i, err.Error(), true)
+		respond(s, i, err.Error(), false)
 		return
 	}
 	release, err := a.calls.reserve(i.Member.User.ID, time.Now())
 	if err != nil {
-		respond(s, i, err.Error(), true)
+		respond(s, i, err.Error(), false)
 		return
 	}
 	defer release()
-	if err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{Type: discordgo.InteractionResponseDeferredChannelMessageWithSource, Data: &discordgo.InteractionResponseData{Flags: discordgo.MessageFlagsEphemeral}}); err != nil {
+	if err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{Type: discordgo.InteractionResponseDeferredChannelMessageWithSource}); err != nil {
 		log.Printf("defer call: %v", err)
 		return
 	}
@@ -226,7 +251,8 @@ func (a *App) handleCall(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	update("音声を準備しています…")
 	ctx, cancel := context.WithTimeout(a.calls.ctx, a.calls.cfg.totalTimeout)
 	defer cancel()
-	status, err := a.calls.run(ctx, message, update)
+	spokenMessage := callSenderName(i.Member) + "さんからのメッセージです。" + message
+	status, err := a.calls.run(ctx, spokenMessage, update)
 	if err != nil {
 		log.Printf("call failed user=%s: %v", i.Member.User.ID, err)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
