@@ -38,6 +38,7 @@ const (
 var errNoWords = errors.New("集計対象の単語がありません")
 
 type App struct {
+	calls        *callService
 	db           *sql.DB
 	loc          *time.Location
 	mu           sync.Mutex
@@ -81,6 +82,13 @@ func main() {
 		log.Fatal(err)
 	}
 	app := &App{db: db, loc: loc, fonts: make(map[int]font.Face), text: analyzer, bgpEvents: make(chan bgpmonitor.Event, 4096), reportHour: reportHour, reportMinute: reportMinute}
+	app.calls, err = newCallService()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if app.calls != nil {
+		defer app.calls.close()
+	}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
@@ -114,6 +122,9 @@ func main() {
 	log.Println("wordcloud bot and BGP monitor started")
 	<-ctx.Done()
 	log.Println("shutdown requested")
+	if app.calls != nil {
+		app.calls.close()
+	}
 	monitor.Shutdown()
 }
 
@@ -167,6 +178,10 @@ func ensureSQLiteColumn(db *sql.DB, table, column, alterStatement string) error 
 
 func (a *App) onReady(s *discordgo.Session, _ *discordgo.Ready) {
 	_, err := s.ApplicationCommandBulkOverwrite(s.State.User.ID, "", []*discordgo.ApplicationCommand{
+		{
+			Name: "call", Description: "指定の内線へ音声メモを送信します",
+			Options: []*discordgo.ApplicationCommandOption{{Type: discordgo.ApplicationCommandOptionString, Name: "message", Description: "読み上げるメッセージ（500文字まで）", Required: true, MaxLength: 500}},
+		},
 		{
 			Name:        "wordcloud",
 			Description: "ワードクラウドの設定を管理します",
@@ -226,6 +241,10 @@ func (a *App) onMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 func (a *App) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionApplicationCommand || i.GuildID == "" {
+		return
+	}
+	if i.ApplicationCommandData().Name == "call" {
+		a.handleCall(s, i)
 		return
 	}
 	if !hasManageMessages(i.Member) {
