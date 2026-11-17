@@ -1,8 +1,0 @@
-; Append to /etc/asterisk/manager_custom.conf; replace secret and permitted IP.
-; FreePBX: fwconsole reload. Restrict TCP/5038 to the bot host at the firewall.
-[discord-memo]
-secret = REPLACE_WITH_A_LONG_RANDOM_SECRET
-deny = 0.0.0.0/0.0.0.0
-permit = 127.0.0.1/255.255.255.255
-read = call,user
-write = originate,call

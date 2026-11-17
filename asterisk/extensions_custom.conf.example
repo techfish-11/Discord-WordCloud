@@ -1,9 +1,0 @@
-; Append to /etc/asterisk/extensions_custom.conf, then run: fwconsole reload
-; Do not expose this context through inbound routes or include it in from-internal.
-[discord-voice-memo]
-exten => s,1,NoOp(Discord voice memo)
- same => n,Set(TIMEOUT(absolute)=130)
- same => n,UserEvent(DiscordMemo,MemoID:${MEMO_ID},Status:answered)
- same => n,Playback(${MEMO_FILE})
- same => n,UserEvent(DiscordMemo,MemoID:${MEMO_ID},Status:played,PlaybackStatus:${PLAYBACKSTATUS})
- same => n,Hangup()

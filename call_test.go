@@ -1,90 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"io"
-	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
-
-func TestAudioConversion(t *testing.T) {
-	ffmpeg, err := exec.LookPath("ffmpeg")
-	if err != nil {
-		t.Skip("FFmpeg is not installed")
-	}
-	for _, seconds := range []int{1, 121} {
-		t.Run(strconv.Itoa(seconds), func(t *testing.T) {
-			// Generate real 24kHz PCM input, as returned by VOICEVOX.
-			pcm := make([]byte, seconds*24000*2)
-			var wav bytes.Buffer
-			wav.WriteString("RIFF")
-			binary.Write(&wav, binary.LittleEndian, uint32(36+len(pcm)))
-			wav.WriteString("WAVEfmt ")
-			for _, v := range []any{uint32(16), uint16(1), uint16(1), uint32(24000), uint32(48000), uint16(2), uint16(16)} {
-				if err := binary.Write(&wav, binary.LittleEndian, v); err != nil {
-					t.Fatal(err)
-				}
-			}
-			wav.WriteString("data")
-			binary.Write(&wav, binary.LittleEndian, uint32(len(pcm)))
-			wav.Write(pcm)
-			directory := t.TempDir()
-			requests := 0
-			c := &callService{cfg: callConfig{directory: directory, ffmpeg: ffmpeg, speaker: 3}, http: &http.Client{Transport: callRoundTripper(func(r *http.Request) (*http.Response, error) {
-				requests++
-				if strings.HasSuffix(r.URL.Path, "audio_query") {
-					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"accent_phrases":[]}`))}, nil
-				}
-				var payload struct {
-					Speaker int                        `json:"speaker"`
-					Query   map[string]json.RawMessage `json:"audioQuery"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Speaker != 3 || payload.Query == nil {
-					t.Errorf("invalid synthesis payload: %v %v", payload, err)
-				}
-				return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(wav.Bytes()))}, nil
-			})}}
-			file, err := c.audio(context.Background(), "hello", "test-audio")
-			if seconds == 121 {
-				if err == nil {
-					t.Fatal("overlong audio accepted")
-				}
-			} else {
-				if err != nil {
-					t.Fatal(err)
-				}
-				data, err := os.ReadFile(file)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if string(data[:4]) != "RIFF" || binary.LittleEndian.Uint32(data[24:28]) != 8000 || binary.LittleEndian.Uint16(data[22:24]) != 1 || binary.LittleEndian.Uint16(data[34:36]) != 16 {
-					t.Fatal("not 8kHz mono 16bit WAV")
-				}
-				if err = os.Remove(file); err != nil {
-					t.Fatal(err)
-				}
-			}
-			entries, err := os.ReadDir(directory)
-			if err != nil || len(entries) != 0 {
-				t.Fatalf("temporary files left behind: %v %v", entries, err)
-			}
-			if requests != 2 {
-				t.Fatalf("unexpected requests: %d", requests)
-			}
-		})
-	}
-}
 
 func TestCallMessageValidation(t *testing.T) {
 	for _, s := range []string{"", " \n", strings.Repeat("あ", 501), "hello\x00", string([]byte{255})} {
@@ -164,13 +89,67 @@ func TestCallReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	release()
-	c.uncertainUntil = now.Add(2 * time.Minute)
-	if _, err := c.reserve("bob", now.Add(time.Minute)); err == nil {
-		t.Fatal("call accepted with an unconfirmed remote call")
-	}
 	c.close()
 	if _, err := c.reserve("bob", now); err == nil {
 		t.Fatal("call accepted during shutdown")
+	}
+}
+
+func TestOptionalCallWhitelist(t *testing.T) {
+	const allowed = "123456789012345678"
+	const other = "234567890123456789"
+	for _, tt := range []struct {
+		name, value           string
+		wantError, restricted bool
+	}{
+		{"unset or empty", "", false, false},
+		{"whitespace", " \t\n", false, false},
+		{"one user", allowed, false, true},
+		{"spaces and duplicate", " " + allowed + ", " + allowed + " ", false, true},
+		{"invalid ID", "invalid", true, false},
+		{"only separator", ",", true, false},
+		{"trailing separator", allowed + ",", true, false},
+		{"invalid among valid", allowed + ",invalid", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			users, err := parseCallAllowedUsers(tt.value)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("parse error=%v, want error=%v", err, tt.wantError)
+			}
+			if err != nil {
+				return
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			c := &callService{ctx: ctx, cancel: cancel, cfg: callConfig{users: users, location: time.UTC, quietStart: 23, quietStartMinute: 59, quietEnd: 6, concurrency: 1, cooldown: time.Minute}, last: make(map[string]time.Time)}
+			now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+			release, err := c.reserve(other, now)
+			if tt.restricted {
+				if err == nil {
+					release()
+					t.Fatal("unlisted user accepted")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unrestricted user rejected: %v", err)
+				}
+				if _, err := c.reserve(allowed, now); err == nil {
+					t.Fatal("concurrency limit bypassed without whitelist")
+				}
+				release()
+				if _, err := c.reserve(other, now.Add(time.Second)); err == nil {
+					t.Fatal("rate limit bypassed without whitelist")
+				}
+			}
+			release, err = c.reserve(allowed, now)
+			if err != nil {
+				t.Fatalf("allowed user rejected: %v", err)
+			}
+			release()
+			if _, err := c.reserve(other, time.Date(2026, 11, 17, 23, 59, 0, 0, time.UTC)); err == nil {
+				t.Fatal("quiet hours bypassed")
+			}
+		})
 	}
 }
 
@@ -198,140 +177,6 @@ func TestConcurrentCallLimit(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("accepted %d calls", count)
-	}
-}
-
-func TestAMIFrames(t *testing.T) {
-	r := newAMIReader(strings.NewReader("Asterisk Call Manager/9.0\r\nResponse: Success\r\nActionID: login\r\n\r\nEvent: Hangup\r\nUniqueid: abc\r\n\r\n"))
-	f, err := r.frame()
-	if err != nil || f["actionid"] != "login" {
-		t.Fatalf("%v %v", f, err)
-	}
-	f, err = r.frame()
-	if err != nil || f["uniqueid"] != "abc" {
-		t.Fatalf("%v %v", f, err)
-	}
-	if _, err = newAMIReader(strings.NewReader("Event: " + strings.Repeat("x", 70<<10))).frame(); err == nil {
-		t.Fatal("oversized frame accepted")
-	}
-	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
-	if amiWrite(a, "Secret: x\r\nAction: Originate") == nil {
-		t.Fatal("AMI injection accepted")
-	}
-}
-
-func TestOriginateLifecycle(t *testing.T) {
-	for _, scenario := range []string{"success", "no-answer", "busy", "failure", "interrupted", "disconnect", "auth", "timeout"} {
-		t.Run(scenario, func(t *testing.T) {
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer listener.Close()
-			done := make(chan error, 1)
-			go func() {
-				conn, err := listener.Accept()
-				if err != nil {
-					done <- err
-					return
-				}
-				defer conn.Close()
-				conn.SetDeadline(time.Now().Add(3 * time.Second))
-				r := newAMIReader(conn)
-				if _, err = r.frame(); err != nil {
-					done <- err
-					return
-				}
-				response := "Success"
-				if scenario == "auth" {
-					response = "Error"
-				}
-				if err = amiWrite(conn, "Response: "+response, "ActionID: login"); err != nil {
-					done <- err
-					return
-				}
-				if scenario == "auth" {
-					done <- nil
-					return
-				}
-				f, err := r.frame()
-				if err != nil {
-					done <- err
-					return
-				}
-				if f["channel"] != "PJSIP/100" || f["channelid"] != "test-call" || f["context"] != "discord-voice-memo" {
-					done <- errors.New("wrong originate target")
-					return
-				}
-				if scenario == "disconnect" {
-					done <- nil
-					return
-				}
-				if scenario == "timeout" {
-					_, _ = r.frame()
-					done <- nil
-					return
-				}
-				if scenario == "no-answer" || scenario == "busy" || scenario == "failure" {
-					reason := "3"
-					if scenario == "busy" {
-						reason = "5"
-					}
-					if scenario == "failure" {
-						reason = "0"
-					}
-					err = amiWrite(conn, "Event: Hangup", "Uniqueid: test-call")
-					if err == nil {
-						err = amiWrite(conn, "Event: OriginateResponse", "ActionID: test-call", "Response: Failure", "Reason: "+reason)
-					}
-					done <- err
-					return
-				}
-				frames := [][]string{
-					{"Event: UserEvent", "UserEvent: DiscordMemo", "MemoID: other-call", "Status: answered"},
-					{"Event: UserEvent", "UserEvent: DiscordMemo", "MemoID: test-call", "Status: answered"},
-				}
-				if scenario != "interrupted" {
-					frames = append(frames, []string{"Event: UserEvent", "UserEvent: DiscordMemo", "MemoID: test-call", "Status: played", "PlaybackStatus: SUCCESS"})
-				}
-				frames = append(frames, []string{"Event: Hangup", "Uniqueid: test-call"})
-				for _, fields := range frames {
-					if err = amiWrite(conn, fields...); err != nil {
-						done <- err
-						return
-					}
-				}
-				_, _ = r.frame()
-				done <- nil
-			}()
-			c := &callService{cfg: callConfig{address: listener.Addr().String(), username: "bot", secret: "secret", extension: "100", pbxDirectory: "/audio", ringTimeout: time.Second}}
-			timeout := 2 * time.Second
-			if scenario == "timeout" {
-				timeout = 100 * time.Millisecond
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-			var updates []string
-			status, err := c.originate(ctx, "test-call", func(s string) { updates = append(updates, s) })
-			wantError := scenario == "failure" || scenario == "disconnect" || scenario == "auth" || scenario == "timeout"
-			if (err != nil) != wantError {
-				t.Fatalf("status=%q err=%v", status, err)
-			}
-			if (scenario == "disconnect" || scenario == "timeout") && !c.uncertainUntil.After(time.Now()) {
-				t.Fatal("unconfirmed remote call did not block new calls")
-			}
-			if scenario == "success" && (!strings.Contains(status, "最後まで再生しました") || len(updates) != 2) {
-				t.Fatalf("wrong lifecycle: %q %v", status, updates)
-			}
-			if scenario == "interrupted" && !strings.Contains(status, "再生されませんでした") {
-				t.Fatalf("unexpected success: %s", status)
-			}
-			if err := <-done; err != nil {
-				t.Fatal(err)
-			}
-		})
 	}
 }
 
@@ -378,7 +223,7 @@ func TestCallDisabledAndInvalidConfig(t *testing.T) {
 		t.Fatal("invalid switch accepted")
 	}
 	t.Setenv("CALL_ENABLED", "true")
-	t.Setenv("CALL_AMI_ADDRESS", "127.0.0.1:5038\r\nAction: Originate")
+	t.Setenv("CALL_SIP_ADDRESS", "127.0.0.1:5038\r\nAction: Originate")
 	if _, err = newCallService(); err == nil {
 		t.Fatal("invalid config accepted")
 	}
